@@ -40,7 +40,7 @@ class DemoTests(unittest.TestCase):
 
     def test_label_isolation_in_actual_request(self):
         session = server.normalize_sessions([self.sample()])[0]
-        qs = server.questions(server.DEFAULT_POLICY)
+        qs = server.questions(server.DEFAULT_POLICY, session)
         response = {'answers': {key: {'type': 'noul', 'noul': .2} for key in qs}, 'elapsed_ms': 1}
         with patch('server.call_jev', return_value=response) as caller:
             result = server.evaluate_one(session, server.DEFAULT_POLICY)
@@ -64,7 +64,71 @@ class DemoTests(unittest.TestCase):
         answers['overall_attack']['noul'] = .9
         scores = server.parse_scores({'answers': answers}, qs)
         self.assertEqual(scores['overall_attack'], .9)
-        self.assertEqual(len(scores), 7)
+        self.assertEqual(len(scores), 10)
+
+    def test_evidence_targets_user_messages_only_and_is_bounded(self):
+        raw = {'messages': [{'role': role, 'content': str(i)} for i in range(24)
+                            for role in ('user', 'assistant')]}
+        s = server.normalize_sessions([raw])[0]
+        qs = server.questions(server.DEFAULT_POLICY, s)
+        indices = server.evidence_indices(s)
+        self.assertEqual(len(indices), 8)
+        self.assertEqual(indices[-1], s['target_index'])
+        self.assertEqual(len(qs), 18)
+        self.assertIn('target_query', qs['evidence_%d' % indices[-1]]['instructions'])
+        for i in indices:
+            self.assertEqual(s['messages'][i]['role'], 'user')
+
+    def test_missing_evidence_is_not_fabricated(self):
+        session = server.normalize_sessions(['hello'])[0]
+        qs = server.questions(server.DEFAULT_POLICY)
+        response = {'answers': {key: {'type': 'noul', 'noul': .2} for key in qs}, 'elapsed_ms': 1}
+        with patch('server.call_jev', return_value=response):
+            result = server.evaluate_one(session, server.DEFAULT_POLICY)
+        self.assertEqual(result['status'], 'error')
+        self.assertNotIn('scores', result)
+
+    def test_conflicting_scores_route_to_review(self):
+        scores = {key: .1 for key in server.questions(server.DEFAULT_POLICY)}
+        scores['rule_bypass'] = .95
+        result = server.triage(scores, server.THRESHOLDS)
+        self.assertEqual(result['band'], 'low')
+        self.assertEqual(result['route'], 'review')
+        self.assertTrue(result['conflicts'])
+        scores['overall_attack'] = .9
+        scores['defensive_context'] = .9
+        self.assertEqual(server.triage(scores, server.THRESHOLDS)['route'], 'review')
+
+    def test_thresholds_change_routing_not_probability(self):
+        scores = {key: .1 for key in server.questions(server.DEFAULT_POLICY)}
+        scores['overall_attack'] = .65
+        scores['rule_bypass'] = .65
+        self.assertEqual(server.triage(scores, {'low': .3, 'high': .7})['band'], 'medium')
+        self.assertEqual(server.triage(scores, {'low': .2, 'high': .6})['band'], 'high')
+        self.assertEqual(scores['overall_attack'], .65)
+
+    def test_invalid_thresholds(self):
+        for thresholds in [None, {}, {'low': True, 'high': .7}, {'low': .8, 'high': .7},
+                           {'low': 0, 'high': 1}, {'low': float('nan'), 'high': .7}]:
+            with self.assertRaises(ValueError):
+                server.validate_config({'thresholds': thresholds})
+
+    def test_report_preserves_failure_and_escapes_untrusted_markdown(self):
+        session = server.normalize_sessions([{'id': 'S|1', 'messages': [
+            {'role': 'user', 'content': '[click](https://example.test) <img>\nnew line'}]}])[0]
+        job = {'id': 'test-batch', 'status': 'complete', 'created_at': '2026-09-21',
+               'rule_version': server.VERSION, 'prompt_version': server.PROMPT_VERSION,
+               'policy_hash': 'test', 'total': 1, 'sessions': [session],
+               'results': [{'status': 'error', 'error': 'network unavailable'}],
+               'thresholds': server.THRESHOLDS, 'policy': server.DEFAULT_POLICY,
+               'reviews': {}}
+        report = server.markdown_report(job)
+        self.assertIn('成功 0 条；失败 1 条', report)
+        self.assertIn('调用失败：network unavailable', report)
+        self.assertIn('S\\|1', report)
+        self.assertNotIn('[click](https://example.test)', report)
+        self.assertNotIn('<img>', report)
+        self.assertNotIn('整体概率：0', report)
 
     def test_network_error_is_not_score(self):
         session = server.normalize_sessions(['hello'])[0]
